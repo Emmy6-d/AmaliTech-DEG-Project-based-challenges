@@ -1,155 +1,227 @@
-# Idempotency-Gateway (The "Pay-Once" Protocol)
+# Idempotency Gateway (The "Pay-Once" Protocol)
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
-
-## 1. Business Context
-
-> **Client:** _FinSafe Transactions Ltd._ (A fast-growing Payment Processor).
-
-### The Problem
-
-FinSafe's clients (e-commerce shops) occasionally experience network timeouts. When this happens, their servers automatically retry sending payment requests. Recently, this has led to a critical issue: **Double Charging**.
-
-If a customer clicks "Pay," the request is sent, but the network lags. The client retries the request. FinSafe processes _both_ requests, charging the customer twice. This is causing customer churn and regulatory headaches.
-
-### The Solution
-
-FinSafe needs you to build an **Idempotency Layer**. This is a middleware service (or API) that ensures no matter how many times a client sends the same request, the payment is processed **exactly once**.
+This service provides an **Idempotency Layer** for financial transactions at FinSafe Transactions Ltd. It acts as a middleware API that guarantees no matter how many times a client retries or resends a payment request, the actual charge is processed **exactly once**, preventing critical double-charging issues while handling concurrent race conditions safely.
 
 ---
 
-## 2. Technical Objective
+## 1. Architecture Flow and Sequence Diagrams
 
-Build a RESTful API that mimics a payment processing backend. It must check for a unique `Idempotency-Key` in the HTTP headers.
+### System Logic Flowchart
 
-- **First Request:** Process the payment and save the response.
-- **Duplicate Request:** Detect the existing key and return the _saved_ response immediately, without processing the payment again.
+This flowchart outlines the lookup, hash validation, and concurrency checks executed for each incoming request:
 
----
+```mermaid
+graph TD
+    A[Client Request POST /process-payment] --> B{Has Idempotency-Key?}
+    B -- No --> C[Return 400 Bad Request]
+    B -- Yes --> D[Compute SHA-256 of Payload]
+    D --> E{Key exists in Store?}
+    
+    E -- Yes --> F{Is Key Expired?}
+    F -- Yes --> G[Delete Key from Store]
+    F -- No --> H{Does Hash Match Stored Hash?}
+    
+    G --> I[Create Record with is_processing=True & asyncio.Future]
+    
+    H -- No --> J[Return 409 Conflict]
+    H -- Yes --> K{Is Record Processing?}
+    
+    K -- Yes --> L[Await asyncio.Future]
+    K -- No --> M[Return Stored Response with X-Cache-Hit: true]
+    
+    L --> N[Return Resolved Future Response with X-Cache-Hit: true]
+    
+    E -- No --> I
+    
+    I --> O[Await Simulate Payment 2s]
+    O --> P[Set Response & is_processing=False]
+    P --> Q[Resolve asyncio.Future with Result]
+    Q --> R[Return Response with X-Cache-Hit: false]
+```
 
-## 3. Getting Started
+### Concurrent Request Sequence Diagram
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**. You may use any database or in-memory store (Redis, SQLite, or a simple native Map/Dictionary variable).
-3.  **Submission:** Your final submission will be a link to your forked repository containing the source code and documentation.
+When two identical requests (A and B) arrive at the exact same time, Request B is blocked and waits for Request A to complete instead of executing a duplicate payment or returning an error:
 
----
+```mermaid
+sequenceDiagram
+    participant ClientA as Client A
+    participant API as Idempotency Gateway
+    participant Store as In-Memory Store
+    participant ClientB as Client B
 
-## 4. The Architecture Diagram
-
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **Flowchart** included in your README.
-
----
-
-## 5. User Stories & Acceptance Criteria
-
-### User Story 1: The First Transaction (Happy Path)
-
-**As a** client system (e.g., an online store),
-**I want to** send a payment request with a unique ID,
-**So that** my transaction is processed successfully.
-
-**Acceptance Criteria:**
-
-- [ ] The API accepts a `POST` request to endpoint `/process-payment`.
-- [ ] The request header must contain `Idempotency-Key: <some-unique-string>`.
-- [ ] The request body accepts a JSON object (e.g., `{"amount": 100, "currency": "GHS"}`).
-- [ ] The server simulates processing (e.g., a 2-second delay) and returns a `200 OK` or `201 Created` response.
-- [ ] The response body should include a status message: `"Charged 100 GHS"`.
-
-### User Story 2: The Duplicate Attempt (Idempotency Logic)
-
-**As a** client system,
-**I want to** safely retry a request if I don't hear back,
-**So that** I don't accidentally double-charge the user.
-
-**Acceptance Criteria:**
-
-- [ ] If the client sends a second `POST` request with the **same** `Idempotency-Key` and payload:
-  - [ ] The server must **NOT** run the processing logic again (no 2-second delay).
-  - [ ] The server must return the **exact same** response body and status code as the first successful request.
-  - [ ] The server returns a header `X-Cache-Hit: true` to indicate this was a replayed response.
-
-### User Story 3: Different Request, Same Key (Fraud/Error Check)
-
-**As a** security officer,
-**I want to** reject requests that reuse keys for different payments,
-**So that** we maintain data integrity.
-
-**Acceptance Criteria:**
-
-- [ ] If a request arrives with an existing `Idempotency-Key` but a **different** request body (e.g., changing amount from 100 to 500):
-  - [ ] The server must return a `422 Unprocessable Entity` or `409 Conflict` error.
-  - [ ] The error message should state: `"Idempotency key already used for a different request body."`
+    ClientA->>API: POST /process-payment (Key: abc123, Payload: P)
+    API->>Store: Register in-flight record (is_processing=True, Future)
+    Note over API: Start payment simulation (2s delay)
+    
+    ClientB->>API: POST /process-payment (Key: abc123, Payload: P)
+    API->>Store: Lookup Key "abc123"
+    Store-->>API: Found record (is_processing=True)
+    Note over API: Await existing record Future (No double processing)
+    
+    Note over API: Payment simulation finishes
+    API->>Store: Save Result, set is_processing=False & resolve Future
+    
+    API-->>ClientA: HTTP 200 OK (X-Cache-Hit: false)
+    API-->>ClientB: HTTP 200 OK (X-Cache-Hit: true)
+```
 
 ---
 
-## 6. Bonus User Story (The "In-Flight" Check)
+## 2. Tech Stack
 
-**As a** system architect,
-**I want to** handle cases where two identical requests arrive at the exact same time,
-**So that** we don't succumb to race conditions.
-
-**Scenario:** Request A arrives. While Request A is still "processing" (during the 2-second delay), Request B (same key) arrives.
-
-**Acceptance Criteria:**
-
-- [ ] Request B should not start a new process.
-- [ ] Request B should not return `409 Conflict`.
-- [ ] Request B should wait (block) until Request A finishes, and then return the result of Request A.
+- **Language:** Python 3.11+ (specifically tested on Python 3.12)
+- **Framework:** FastAPI (asynchronous, high performance)
+- **Server:** Uvicorn
+- **Validation:** Pydantic (data parsing and constraints)
+- **Storage:** Thread-safe, coroutine-safe in-memory storage (`dict`)
+- **Tests:** Pytest, HTTPX (async client), and AnyIO
 
 ---
 
-## 7. The "Developer's Choice" Challenge
+## 3. Setup and Running Instructions
 
-We believe great engineers are also product thinkers.
+### Local Setup
 
-**Task:** Identify **one** additional feature or safety mechanism that would make this system better for a real-world Fintech company.
+1. **Navigate to the directory:**
+   ```bash
+   cd backend/Idempotency-gateway
+   ```
 
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
+2. **Create a virtual environment:**
+   ```bash
+   python -m venv venv
+   ```
 
----
+3. **Activate the virtual environment:**
+   - **Windows (PowerShell):**
+     ```powershell
+     .\venv\Scripts\Activate.ps1
+     ```
+   - **Windows (CMD):**
+     ```cmd
+     .\venv\Scripts\activate.bat
+     ```
+   - **macOS / Linux:**
+     ```bash
+     source venv/bin/activate
+     ```
 
-## 8. Documentation Requirements
+4. **Install the dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Your final `README.md` must replace these instructions. It must cover:
+### Running the API Server
 
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **Design Decisions**
-5.  **The Developer's Choice:** Description of the extra feature you added.
+Start the FastAPI application with Uvicorn:
 
----
+```bash
+uvicorn app.main:app --reload
+```
 
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
-
----
-
-## 🛑 Pre-Submission Checklist
-
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
+The server will start at `http://127.0.0.1:8000`. You can access the interactive API docs at `http://127.0.0.1:8000/docs`.
 
 ---
 
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+## 4. API Documentation
+
+### Process Payment
+
+Processes a new payment transaction or replays a cached transaction safely.
+
+* **URL:** `/process-payment`
+* **Method:** `POST`
+* **Headers:**
+  - `Idempotency-Key` (Required, string): A unique key representing the transaction attempt.
+  - `Content-Type`: `application/json`
+* **Request Body:**
+  ```json
+  {
+    "amount": 100,
+    "currency": "GHS"
+  }
+  ```
+
+#### Example Response - First Attempt (Success)
+* **Status Code:** `200 OK`
+* **Headers:**
+  - `X-Cache-Hit`: `false`
+* **Body:**
+  ```json
+  {
+    "message": "Charged 100 GHS"
+  }
+  ```
+
+#### Example Response - Duplicate Attempt (Cached Replay)
+* **Status Code:** `200 OK`
+* **Headers:**
+  - `X-Cache-Hit`: `true`
+* **Body:**
+  ```json
+  {
+    "message": "Charged 100 GHS"
+  }
+  ```
+
+#### Example Response - Fraud / Data Mismatch
+* **Status Code:** `409 Conflict`
+* **Body:**
+  ```json
+  {
+    "detail": "Idempotency key already used for a different request body."
+  }
+  ```
+
+#### Example Response - Missing Header
+* **Status Code:** `400 Bad Request`
+* **Body:**
+  ```json
+  {
+    "detail": "Idempotency-Key header is required"
+  }
+  ```
+
+---
+
+## 5. Design Decisions and Key Mechanics
+
+### 1. Concurrency Handling (`asyncio.Future`)
+The core challenge in idempotency is blocking subsequent requests that arrive *while* the first is still processing. 
+* When a request starts, it inserts an `IdempotencyRecord` containing a pending `asyncio.Future`.
+* If a concurrent request arrives with the same key, it detects the in-flight status (`is_processing=True`) and simply executes `await record.future`.
+* When the primary request finishes, it calls `future.set_result((status_code, body))` which instantly resolves the waiting request, returning the same response without running any payment logic a second time.
+* If the primary request fails with an exception, the exception is set on the future to unblock waiters, and the record is deleted so clients can safely retry.
+
+### 2. Request Fingerprinting (SHA-256)
+To verify request body integrity and prevent fraud (e.g., reusing an idempotency key to send a different amount), we compute a SHA-256 hash of the request payload.
+* The Pydantic model is serialized to a compact JSON string with sorted keys (`sort_keys=True`) and no whitespace (`separators=(',', ':')`).
+* This normalized string is hashed. The resulting SHA-256 hex digest acts as a fingerprint, which is saved alongside the key.
+* Reusing the same key with a different body will mismatch the stored hash, returning an `HTTP 409 Conflict`.
+
+### 3. Developer's Choice Feature: Time-To-Live (TTL) Expiration
+We implemented a Time-To-Live (TTL) mechanism for the cached idempotency records.
+* **Why TTL is important:** In real payment systems, saving idempotency keys forever is impractical and dangerous. It causes unbounded memory growth and blocks clients from reusing valid transactional references years down the line. A standard TTL (like 24 hours) clears cache space and recycles key metadata while still protecting against network retries (which occur within seconds or minutes).
+* **Implementation:** The record stores a `created_at` timestamp.
+  - When the storage looks up a record, it lazily evaluates whether the elapsed time exceeds the `default_ttl_seconds` (e.g., 60 seconds).
+  - If expired, the record is deleted and processed as a fresh request.
+  - The TTL starts ticking from the *completion* of the payment request (rather than starting at creation), preventing keys from expiring prematurely during heavy API latency.
+
+---
+
+## 6. Testing Instructions
+
+Run the pytest suite to verify all requirements are working:
+
+```bash
+pytest tests/
+```
+
+### Covered Test Cases
+1. **First Payment Success:** Validates payload, 2-second processing delay, correct response body, and `X-Cache-Hit: false`.
+2. **Duplicate Request Replay:** Validates that subsequent duplicate requests return immediately (<0.1s), with matching body and `X-Cache-Hit: true`.
+3. **Mismatched Payload Conflict:** Validates that reusing the same key with a modified body returns `409 Conflict`.
+4. **Missing Header:** Validates that calls without `Idempotency-Key` are rejected with `400 Bad Request`.
+5. **Concurrent Blocking:** Simulates two requests arriving at the same time using `asyncio.gather`. Verifies they take a total of 2 seconds (not 4), process once, and return identical results with correct headers.
+6. **TTL Expiration:** Configures TTL to 0.5s, sleeps 0.6s, and verifies that the key is cleared and successfully processed again.
